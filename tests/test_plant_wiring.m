@@ -49,6 +49,7 @@ tcmp = zeros(numel(cases), 1);
 for c = 1:numel(cases)
     K = cases(c);
     in = Simulink.SimulationInput(mdl);
+    in = in.setVariable('tire_mode', 0);   % notlar modu (S1 plant)
     in = in.setVariable('T_end', K.Tend);
     in = in.setVariable('vx0_init', K.v0);
     in = in.setVariable('Fx_in', K.Ftab);
