@@ -12,16 +12,17 @@ root = fileparts(fileparts(mfilename('fullpath')));
 mdl  = 'VehicleDiagram';
 
 % path ve Simulink onbellegi gecici; sonda eski haline doner
+wasLoaded = bdIsLoaded(mdl);
 oldpath = addpath(root);
 cache   = tempname;
 oldcfg  = Simulink.fileGenControl('getConfig');
 Simulink.fileGenControl('set', 'CacheFolder', cache, 'CodeGenFolder', cache, ...
     'createDir', true);
-cleanup = onCleanup(@() restore(mdl, oldpath, oldcfg, cache)); %#ok<NASGU>
+cleanup = onCleanup(@() restore(mdl, wasLoaded, oldpath, oldcfg, cache)); %#ok<NASGU>
 
 assert(strcmp(which([mdl '.slx']), fullfile(root, [mdl '.slx'])), ...
     'Path''te baska bir %s.slx var: %s', mdl, which([mdl '.slx']));
-evalin('base', 'Model_Setup');
+evalin('base', 'map_name = ''Rectangle''; Model_Setup');
 
 % referans parametreleri (Model_Setup'tan bagimsiz yazildi)
 P = struct('m',1500,'Iz',2250,'L',2.7,'lr',1.35,'lf',2.7-1.35,'Cf',38000,'Cr',38000, ...
@@ -54,6 +55,12 @@ for c = 1:numel(cases)
     in = in.setVariable('vx0_init', K.v0);
     in = in.setVariable('Fx_in', K.Ftab);
     in = in.setVariable('delta_in', K.dtab);
+    % S2 etkisiz: baslangic konumu referans ile ayni (Model_Setup artik yolun
+    % basini verir), bitis mantigi kapali (B'de arac durur)
+    in = in.setVariable('X0', 0);
+    in = in.setVariable('Y0', 0);
+    in = in.setVariable('psi0', 0);
+    in = in.setVariable('stop_enable', 0);
     out = sim(in);
     t = out.state.Time;
     x = out.state.Data;
@@ -80,8 +87,8 @@ fprintf('GECTI (max olcekli hata %.3e)\n', max(err(:)));
 end
 
 %% ======================================================================
-function restore(mdl, oldpath, oldcfg, cache)
-if bdIsLoaded(mdl), close_system(mdl, 0); end
+function restore(mdl, wasLoaded, oldpath, oldcfg, cache)
+if ~wasLoaded && bdIsLoaded(mdl), close_system(mdl, 0); end
 Simulink.fileGenControl('setConfig', 'config', oldcfg);
 path(oldpath);
 if exist(cache, 'dir'), rmdir(cache, 's'); end

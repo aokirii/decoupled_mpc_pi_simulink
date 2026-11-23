@@ -1,5 +1,5 @@
 function build_model()
-%BUILD_MODEL  VehicleDiagram.slx'i sifirdan uretir (S1 + S1b: Plant, acik cevrim).
+%BUILD_MODEL  VehicleDiagram.slx'i sifirdan uretir (S1 + S1b: Plant; S2: Referans, Hata Hesabi, Bitis).
 %   Blok yapisi el cizimi diyagrami izler:
 %     Plant = [Dinamik Denklem -> Integrator (hiz) -> Kinematik Denklem
 %              -> Integrator (konum)], geri beslemeler v_x, v_y, r, psi.
@@ -7,9 +7,15 @@ function build_model()
 %   (tekerlek); Lastik Modeli (gecici kayma + Dugoff) -> Integrator (kayma);
 %   Dinamik Denklem a_x -> Filtre a_x -> Yuk Transferi -> Lastik Modeli.
 %   tire_mode = 0 ("notlar") S1 davranisini aynen verir; 1 = "tam".
-%   Ust seviyede yalniz test girisleri (From Workspace: F_x, delta), Plant
-%   ve loglama (To Workspace) vardir. Referans, Hata Hesabi, kontrolculer ve
-%   Gorsellestirme S2-S4'te eklenir.
+%   Ust seviye: test girisleri (From Workspace: F_x, delta), Plant (acik
+%   cevrim, surekli, Ts_plant), S2 bloklari ve loglama (To Workspace).
+%   S2 (ayrik, Ts_ctrl; plant durumu ZOH ile orneklenir):
+%     Referans    : Unit Delay s_ref (IC ref.s0) + ref_advance; cikislar
+%                   s_ref, X_ref, Y_ref, psi_ref, v_ref, kappa_ref
+%     Hata Hesabi : ref_error; geri besleme Unit Delay idx, lap, s_proj (IC 0)
+%     Bitis       : ref_done + Unit Delay n_slow (IC 0) + Stop Simulation
+%   Kontrolculer (S3, boyuna ve yanal MPC) ve Gorsellestirme (S4) sonra
+%   eklenir; S2 su an plant'i surmez, yalniz loglanir.
 %   Parametreler base workspace'ten okunur: once Model_Setup calistirin.
 %   Son dosya R2024b bicimine aktarilir (Mac uyumu).
 %
@@ -69,6 +75,7 @@ add_block('simulink/Sinks/To Workspace', [mdl '/log_input'], ...
     'VariableName', 'u_in', tw{:}, 'Position', [520 248 600 272]);
 
 build_plant(plant);
+build_s2(mdl, tw);
 
 al = {'autorouting', 'smart'};
 add_line(mdl, 'F_x/1',   'Plant/1', al{:});
@@ -250,6 +257,131 @@ for k = 1:size(sig, 1)
             set_param(ph.Outport(i), 'DataLogging', 'on');
         end
     end
+end
+end
+
+%% ======================================================================
+function build_s2(mdl, tw)
+% S2 bloklari. Hepsi ayrik (Ts_ctrl); plant durumu ZOH ile orneklenir.
+% Geri beslemeler Unit Delay: s_ref (IC ref.s0), idx / lap / s_proj (IC 0;
+% idx = 0 ilk adimda global arama), n_slow (IC 0). MATLAB Function
+% parametreleri (ref, fin, win_*, stop_enable, Ts_ctrl) ayarlanamaz.
+al  = {'autorouting', 'smart'};
+mfb = 'simulink/User-Defined Functions/MATLAB Function';
+ud  = @(blk, ic, pos) add_block('built-in/UnitDelay', blk, 'InitialCondition', ic, ...
+    'SampleTime', 'Ts_ctrl', 'Position', pos, 'Orientation', 'left');
+zoh = @(blk, pos) add_block('simulink/Discrete/Zero-Order Hold', blk, ...
+    'SampleTime', 'Ts_ctrl', 'Position', pos);
+
+% --- Referans ---
+rs = [mdl '/Referans'];
+add_block('built-in/Subsystem', rs, 'Position', [40 360 180 540]);
+add_block(mfb, [rs '/Referans Noktasi'], 'Position', [200 30 360 230]);
+set_s2_mfunction([rs '/Referans Noktasi'], refpt_script(), {'ref', 'Ts_ctrl'});
+ud([rs '/z_s_ref'], 'ref.s0', [260 280 300 310]);
+ro = {'s_ref', 'X_ref', 'Y_ref', 'psi_ref', 'v_ref', 'kappa_ref'};
+add_ports(rs, {}, ro, 470);
+add_line(rs, 'z_s_ref/1', 'Referans Noktasi/1', al{:});
+add_line(rs, 'Referans Noktasi/1', 'z_s_ref/1', al{:});
+add_line(rs, 'z_s_ref/1', 's_ref/1', al{:});
+for i = 2:6, add_line(rs, sprintf('Referans Noktasi/%d', i), [ro{i} '/1'], al{:}); end
+name_line([rs '/Referans Noktasi'], 1, 's_next');
+name_line([rs '/z_s_ref'], 1, 's_ref');
+
+% --- Hata Hesabi ---
+hs = [mdl '/Hata Hesabi'];
+add_block('built-in/Subsystem', hs, 'Position', [300 360 460 600]);
+ho = {'e', 's_veh', 's_proj', 'idx', 'lap', 'kappa_p', 'v_ref_p', 's_dot'};
+add_ports(hs, {'state', 's_ref'}, ho, 520);
+zoh([hs '/ZOH'], [110 35 145 65]);
+add_block(mfb, [hs '/Hata'], 'Position', [220 30 380 290]);
+set_s2_mfunction([hs '/Hata'], err_script(), {'ref', 'win_fwd', 'win_back'});
+% e 1-B vektor (6), log N x 6 olsun (varsayilan [6 1] 6 x 1 x N verir)
+ch = sfroot().find('-isa', 'Stateflow.EMChart', 'Path', [hs '/Hata']);
+ch.find('-isa', 'Stateflow.Data', 'Name', 'e').Props.Array.Size = '6';
+ud([hs '/z_idx'],    '0', [280 330 320 360]);
+ud([hs '/z_lap'],    '0', [280 390 320 420]);
+ud([hs '/z_s_proj'], '0', [280 450 320 480]);
+add_line(hs, 'state/1', 'ZOH/1', al{:});
+add_line(hs, 'ZOH/1', 'Hata/1', al{:});
+add_line(hs, 's_ref/1', 'Hata/2', al{:});
+add_line(hs, 'z_idx/1', 'Hata/3', al{:});
+add_line(hs, 'z_lap/1', 'Hata/4', al{:});
+add_line(hs, 'z_s_proj/1', 'Hata/5', al{:});
+add_line(hs, 'Hata/4', 'z_idx/1', al{:});
+add_line(hs, 'Hata/5', 'z_lap/1', al{:});
+add_line(hs, 'Hata/3', 'z_s_proj/1', al{:});
+for i = 1:numel(ho), add_line(hs, sprintf('Hata/%d', i), [ho{i} '/1'], al{:}); end
+for i = 1:numel(ho), name_line([hs '/Hata'], i, ho{i}); end
+name_line([hs '/ZOH'], 1, 'state_k');
+
+% --- Bitis ---
+bs = [mdl '/Bitis'];
+add_block('built-in/Subsystem', bs, 'Position', [580 560 700 640]);
+add_ports(bs, {'s_veh', 'state'}, {'done'}, 460);
+zoh([bs '/ZOH'], [110 105 145 135]);
+add_block(mfb, [bs '/Bitis Mantigi'], 'Position', [220 30 360 170]);
+set_s2_mfunction([bs '/Bitis Mantigi'], done_script(), {'stop_enable', 'ref', 'fin', 'Ts_ctrl'});
+ud([bs '/z_n_slow'], '0', [270 210 310 240]);
+add_block('simulink/Sinks/Stop Simulation', [bs '/Stop'], 'Position', [460 120 490 150]);
+add_line(bs, 's_veh/1', 'Bitis Mantigi/1', al{:});
+add_line(bs, 'state/1', 'ZOH/1', al{:});
+add_line(bs, 'ZOH/1', 'Bitis Mantigi/2', al{:});
+add_line(bs, 'z_n_slow/1', 'Bitis Mantigi/3', al{:});
+add_line(bs, 'Bitis Mantigi/2', 'z_n_slow/1', al{:});
+add_line(bs, 'Bitis Mantigi/1', 'done/1', al{:});
+add_line(bs, 'Bitis Mantigi/1', 'Stop/1', al{:});
+name_line([bs '/Bitis Mantigi'], 1, 'done');
+name_line([bs '/Bitis Mantigi'], 2, 'n_slow');
+
+% --- Ust seviye baglanti ve loglama ---
+add_line(mdl, 'Plant/1', 'Hata Hesabi/1', al{:});
+add_line(mdl, 'Referans/1', 'Hata Hesabi/2', al{:});
+add_line(mdl, 'Hata Hesabi/2', 'Bitis/1', al{:});
+add_line(mdl, 'Plant/1', 'Bitis/2', al{:});
+add_block('built-in/Mux', [mdl '/Mux_ref'], 'Inputs', '6', 'Position', [240 620 245 740]);
+for i = 1:6
+    add_line(mdl, sprintf('Referans/%d', i), sprintf('Mux_ref/%d', i), al{:});
+    name_line([mdl '/Referans'], i, ro{i});
+end
+lg = {'Mux_ref', 1, 'ref_pt'; 'Hata Hesabi', 1, 'err'; 'Hata Hesabi', 2, 's_veh';
+      'Hata Hesabi', 3, 's_proj'; 'Hata Hesabi', 4, 'idx'; 'Hata Hesabi', 5, 'lap';
+      'Hata Hesabi', 6, 'kappa_p'; 'Hata Hesabi', 7, 'v_ref_p'; 'Hata Hesabi', 8, 's_dot';
+      'Bitis', 1, 'done'};
+for i = 1:size(lg, 1)
+    y = 340 + (i - 1)*45;
+    add_block('simulink/Sinks/To Workspace', [mdl '/log_' lg{i,3}], ...
+        'VariableName', lg{i,3}, tw{:}, 'Position', [800 y 880 y + 24]);
+    add_line(mdl, sprintf('%s/%d', lg{i,1}, lg{i,2}), ['log_' lg{i,3} '/1'], al{:});
+end
+for i = 1:numel(ho), name_line([mdl '/Hata Hesabi'], i, ho{i}); end
+name_line([mdl '/Mux_ref'], 1, 'ref_pt');
+name_line([mdl '/Bitis'], 1, 'done');
+end
+
+function add_ports(sub, ins, outs, xo)
+% alt sistem giris / cikis portlari (sirali)
+for i = 1:numel(ins)
+    y = 43 + (i - 1)*70;
+    add_block('built-in/Inport', [sub '/' ins{i}], 'Port', num2str(i), ...
+        'Position', [30 y 60 y + 14]);
+end
+for i = 1:numel(outs)
+    y = 43 + (i - 1)*35;
+    add_block('built-in/Outport', [sub '/' outs{i}], 'Port', num2str(i), ...
+        'Position', [xo y xo + 30 y + 14]);
+end
+end
+
+function set_s2_mfunction(blk, script, params)
+% S2 MATLAB Function: ayrik (Ts_ctrl); parametreler ayarlanamaz (ref gibi
+% struct'lar sabit boyutla derlenir).
+set_mfunction(blk, script, params);
+ch = sfroot().find('-isa', 'Stateflow.EMChart', 'Path', blk);
+ch.SampleTime = 'Ts_ctrl';
+for k = 1:numel(params)
+    d = ch.find('-isa', 'Stateflow.Data', 'Name', params{k});
+    d.Tunable = false;
 end
 end
 
@@ -450,6 +582,46 @@ s = strjoin({
 'vy_dot = (F_yf*cos(delta) + F_xf*sin(delta) + F_yr)/m - v_x*r;'
 'r_dot  = (lf*(F_yf*cos(delta) + F_xf*sin(delta)) - lr*F_yr)/Iz;'
 'a_x    = vx_dot - v_y*r;   % govde boyuna ivmesi (yuk transferi icin)'
+}, newline);
+end
+
+function s = refpt_script()
+s = strjoin({
+'function [s_next, X_ref, Y_ref, psi_ref, v_ref, kappa_ref] = fcn(s_ref, ref, Ts_ctrl)'
+'% Referans Noktasi: s_ref[k+1] = s_ref[k] + v_ref(s_ref[k] mod L) Ts_ctrl'
+'% (ref_advance); s_ref noktasinda yolun konumu, yonu, hizi ve egriligi'
+'% (lineer ara deger, yon sarma farkiyla).'
+'s_next    = ref_advance(s_ref, ref, Ts_ctrl);'
+'X_ref     = periodic_interp(ref.x, s_ref, ref.ds);'
+'Y_ref     = periodic_interp(ref.y, s_ref, ref.ds);'
+'v_ref     = periodic_interp(ref.v, s_ref, ref.ds);'
+'kappa_ref = periodic_interp(ref.kappa, s_ref, ref.ds);'
+'N = numel(ref.theta);'
+'u = s_ref/ref.ds;  j = floor(u);  t = u - j;'
+'a = mod(j, N) + 1;  b = mod(j + 1, N) + 1;'
+'dth = mod(ref.theta(b) - ref.theta(a) + pi, 2*pi) - pi;'
+'psi_ref = mod(ref.theta(a) + t*dth + pi, 2*pi) - pi;'
+}, newline);
+end
+
+function s = err_script()
+s = strjoin({
+'function [e, s_veh, s_proj, idx, lap, kappa_p, v_ref_p, s_dot] = fcn(x, s_ref, idx_prev, lap_prev, s_proj_prev, ref, win_fwd, win_back)'
+'% Hata: x = [X Y psi v_x v_y r] (ZOH), s_ref acilmis. ref_error (Rajamani 2.5).'
+'% e = [e_x; e_y; e_psi; e_x_dot; e_y_dot; e_psi_dot].'
+'[e_x, e_y, e_psi, e_x_dot, e_y_dot, e_psi_dot, s_veh, s_proj, idx, lap, ~, v_ref_p, kappa_p, ~, s_dot] = ...'
+'    ref_error(x(1), x(2), x(3), x(4), x(5), x(6), s_ref, idx_prev, lap_prev, s_proj_prev, ...'
+'              ref, win_fwd, win_back);'
+'e = [e_x; e_y; e_psi; e_x_dot; e_y_dot; e_psi_dot];'
+}, newline);
+end
+
+function s = done_script()
+s = strjoin({
+'function [done, n_slow] = fcn(s_veh, x, n_slow_prev, stop_enable, ref, fin, Ts_ctrl)'
+'% Bitis Mantigi: tur (s_veh - s0 >= n_laps L) ya da t_hold boyunca'
+'% hypot(v_x, v_y) < v_stop; stop_enable = 0 iken hic bitmez (ref_done).'
+'[done, n_slow] = ref_done(s_veh, x(4), x(5), n_slow_prev, stop_enable, ref, fin, Ts_ctrl);'
 }, newline);
 end
 

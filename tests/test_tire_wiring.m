@@ -41,7 +41,7 @@ cleanup = onCleanup(@() restore(mdl, wasLoaded, oldpath, oldcfg, cache)); %#ok<N
 
 assert(strcmp(which([mdl '.slx']), fullfile(root, [mdl '.slx'])), ...
     'Path''te baska bir %s.slx var: %s', mdl, which([mdl '.slx']));
-evalin('base', 'Model_Setup');
+evalin('base', 'map_name = ''Rectangle''; Model_Setup');
 
 % --- sabit parametreler (modele setVariable ile verilir) ---
 mv = struct('tire_mode', 1, ...
@@ -86,6 +86,7 @@ for c = 1:numel(cases)
     in = in.setVariable('vx0_init', K.v0);
     in = in.setVariable('Fx_in', K.Ftab);
     in = in.setVariable('delta_in', K.dtab);
+    in = in.setVariable('stop_enable', 0);   % S2 bitis mantigi kapali (durma ile erken bitmesin)
     out = sim(in);
     t = out.state.Time;
     x = out.state.Data;

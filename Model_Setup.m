@@ -1,8 +1,11 @@
-%% Model_Setup.m -- VehicleDiagram.slx parametreleri (S1: Plant, acik cevrim)
+%% Model_Setup.m -- VehicleDiagram.slx parametreleri (S1 Plant, S2 Referans + Hata Hesabi)
 % Tum degiskenler base workspace'e yazilir. Testler bu betigi calistirip
 % degiskenleri (base'te) ezdikten sonra sim('VehicleDiagram') cagirabilir.
 % Not: bilincli olarak 'clear' yok; bir fonksiyon icinden cagrilinca
 % cagiranin calisma alanini silmesin.
+% Harita: map_name ('Circle' | 'Rectangle' | 'Hand') cagiranin calisma
+% alaninda varsa o kullanilir, yoksa 'Rectangle'. Hand ginput ister
+% (yalniz elle kullanim).
 
 %% --- Arac parametreleri ---
 m     = 1500;         % kutle [kg]
@@ -46,15 +49,36 @@ v_eps    = 0.02;      % tam modda yuvarlanma direnci tanh(v_x/v_eps) gecis hizi 
 
 %% --- Simulasyon ---
 Ts_plant = 1e-3;      % sabit adim [s] (ode4)
+Ts_ctrl  = 0.02;      % kontrol / referans ornekleme suresi [s] (Ts_plant'in tam kati)
 T_end    = 20;        % bitis zamani [s]
 
+%% --- Referans yol ve hata hesabi (S2) ---
+% Harita -> interpolasyon yontemi / kose yaricapi (diyagram-simulink-matematik.md 3.2)
+if ~exist('map_name', 'var') || isempty(map_name), map_name = 'Rectangle'; end
+switch map_name
+    case 'Circle',    ms_map__ = {'YuvarlakMap.m',   'spline', 0};
+    case 'Rectangle', ms_map__ = {'KareMap.m',       'spline', 8};
+    case 'Hand',      ms_map__ = {'HandFigureMap.m', 'pchip',  0};
+    otherwise, error('Model_Setup: map_name ''Circle'', ''Rectangle'' ya da ''Hand'' olmali.');
+end
+[waypoints, startPt] = ms_load_map__(fullfile(fileparts(mfilename('fullpath')), 'maps', ms_map__{1}));
+prm_ref = struct('ds_target', 0.1, 'corner_radius', ms_map__{3}, ...
+                 'interp_method', ms_map__{2}, 'v_max', 8, 'ay_max', 0.85*mu*g, ...
+                 'ax_max', 3, 'ax_min', -6, 'v_min', 2, 'kappa_win', 3);
+clear ms_map__
+ref = reference_path(waypoints, startPt, prm_ref);   % yol uzunlugu ref.L (L = dingil mesafesi)
+win_fwd  = 120;       % en yakin nokta arama penceresi, ileri [dugum]
+win_back = 20;        % geri [dugum]
+fin = struct('n_laps', 3, 'v_stop', 0.05, 't_hold', 0.5);   % bitis olcutleri (Ts = Ts_ctrl ayri)
+stop_enable = 1;      % 0: bitis mantigi kapali (plant testleri)
+
 %% --- Baslangic kosullari ---
-vx0_init = 8;         % boyuna hiz [m/s]
-vy0_init = 0;         % yanal hiz [m/s]
-r0_init  = 0;         % yaw hizi [rad/s]
-X0       = 0;         % global konum X [m]
-Y0       = 0;         % global konum Y [m]
-psi0     = 0;         % yaw acisi [rad]
+vx0_init = ref.v(ref.idx0);   % boyuna hiz [m/s] (hiz profilinden)
+vy0_init = 0;                 % yanal hiz [m/s]
+r0_init  = 0;                 % yaw hizi [rad/s]
+X0       = ref.x(ref.idx0);   % global konum X [m] (yolun baslangic noktasi)
+Y0       = ref.y(ref.idx0);   % global konum Y [m]
+psi0     = ref.theta0;        % yaw acisi [rad] (yol yonu)
 
 %% --- Test girisleri (From Workspace, [t u]; son degerde tutulur) ---
 Fx_in    = [0 250; T_end 250];   % toplam boyuna kuvvet [N]
@@ -67,7 +91,9 @@ ms_names__ = {'m','Iz','L','lr','lf','Cf','Cr', ...
          'tire_mode','R_e','I_w','C_kappa','c_x','sigma_x','sigma_y', ...
          'mu','h','tau_ax','k_low0','v_low','tau_c','v_eps', ...
          'vx0_init','vy0_init','r0_init','X0','Y0','psi0', ...
-         'Fx_in','delta_in'};
+         'Fx_in','delta_in', ...
+         'Ts_ctrl','map_name','waypoints','startPt','prm_ref','ref', ...
+         'win_fwd','win_back','fin','stop_enable'};
 % Dongu/liste degiskenleri cagiranin degiskenleriyle cakismasin diye
 % benzersiz adli; yalniz bunlar temizlenir.
 for ms_i__ = 1:numel(ms_names__)
@@ -75,5 +101,18 @@ for ms_i__ = 1:numel(ms_names__)
 end
 clear ms_i__ ms_names__
 
-fprintf('Model_Setup: parametreler base workspace''e yuklendi (T_end = %g s, Ts_plant = %g s).\n', ...
-        T_end, Ts_plant);
+fprintf(['Model_Setup: parametreler base workspace''e yuklendi (T_end = %g s, Ts_plant = %g s, ' ...
+         'harita %s, L_yol = %.2f m).\n'], T_end, Ts_plant, map_name, ref.L);
+
+%% ======================================================================
+function [wp, sp] = ms_load_map__(file)
+% Harita betigini fonksiyon calisma alaninda calistirir; ara degiskenleri
+% (C, P, N, x, y, ...) base'e sizmaz. Ancak harita betiklerinin kendi
+% assignin('base', ...) cagrilari waypoints, startPt ve goal'u base'e
+% yazar (goal S2'de kullanilmaz). Yalniz haritanin actigi figurler kapanir.
+figs0 = findall(groot, 'Type', 'figure');
+run(file);
+wp = eval('waypoints');
+sp = eval('startPt');
+close(setdiff(findall(groot, 'Type', 'figure'), figs0));
+end
