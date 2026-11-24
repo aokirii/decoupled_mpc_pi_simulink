@@ -1,12 +1,10 @@
 function build_model()
-%BUILD_MODEL  VehicleDiagram.slx'i sifirdan uretir (S1 + S1b: Plant; S2: Referans, Hata Hesabi, Bitis).
-%   Blok yapisi el cizimi diyagrami izler:
-%     Plant = [Dinamik Denklem -> Integrator (hiz) -> Kinematik Denklem
-%              -> Integrator (konum)], geri beslemeler v_x, v_y, r, psi.
-%   S1b tam tekerlek modeli: Aktuator -> Tekerlek Dinamigi -> Integrator
-%   (tekerlek); Lastik Modeli (gecici kayma + Dugoff) -> Integrator (kayma);
-%   Dinamik Denklem a_x -> Filtre a_x -> Yuk Transferi -> Lastik Modeli.
-%   tire_mode = 0 ("notlar") S1 davranisini aynen verir; 1 = "tam".
+%BUILD_MODEL  VehicleDiagram.slx'i sifirdan uretir (S1: Plant, sade lastik; S2:
+%   Referans, Hata Hesabi, Bitis; S3: Lateral C, Longitudinal C, kapali dongu).
+%   Blok yapisi el cizimi diyagrami izler, Plant soldan saga:
+%     Yuk Transferi -> Lastik Modeli (Dugoff + surtunme cemberi) -> Dinamik
+%     Denklem -> Integrator (hiz) -> Kinematik Denklem -> Integrator (konum),
+%     geri beslemeler v_x, v_y, r, psi ve a_x (Memory a_x, bir adim).
 %   Ust seviye: test girisleri (From Workspace: F_x, delta), Plant (acik
 %   cevrim, surekli, Ts_plant), S2 bloklari ve loglama (To Workspace).
 %   S2 (ayrik, Ts_ctrl; plant durumu ZOH ile orneklenir):
@@ -14,8 +12,10 @@ function build_model()
 %                   s_ref, X_ref, Y_ref, psi_ref, v_ref, kappa_ref
 %     Hata Hesabi : ref_error; geri besleme Unit Delay idx, lap, s_proj (IC 0)
 %     Bitis       : ref_done + Unit Delay n_slow (IC 0) + Stop Simulation
-%   Kontrolculer (S3, boyuna ve yanal MPC) ve Gorsellestirme (S4) sonra
-%   eklenir; S2 su an plant'i surmez, yalniz loglanir.
+%   S3 (ayrik, Ts_ctrl): Lateral C (lat_mpc -> delta), Longitudinal C
+%     (lon_mpc -> F_x); ikisi de mpc_qp. ctrl_enable Switch'i: 1 -> MPC
+%     komutlari, 0 -> test girisleri (Fx_in, delta_in; plant testleri).
+%   Gorsellestirme (S4) sonra eklenir.
 %   Parametreler base workspace'ten okunur: once Model_Setup calistirin.
 %   Son dosya R2024b bicimine aktarilir (Mac uyumu).
 %
@@ -76,16 +76,17 @@ add_block('simulink/Sinks/To Workspace', [mdl '/log_input'], ...
 
 build_plant(plant);
 build_s2(mdl, tw);
+build_s3(mdl, tw);
 
 al = {'autorouting', 'smart'};
-add_line(mdl, 'F_x/1',   'Plant/1', al{:});
-add_line(mdl, 'delta/1', 'Plant/2', al{:});
-add_line(mdl, 'F_x/1',   'Mux_u/1', al{:});
-add_line(mdl, 'delta/1', 'Mux_u/2', al{:});
+add_line(mdl, 'Sw_Fx/1',    'Plant/1', al{:});
+add_line(mdl, 'Sw_delta/1', 'Plant/2', al{:});
+add_line(mdl, 'Sw_Fx/1',    'Mux_u/1', al{:});
+add_line(mdl, 'Sw_delta/1', 'Mux_u/2', al{:});
 add_line(mdl, 'Plant/1', 'log_state/1', al{:});
 add_line(mdl, 'Mux_u/1', 'log_input/1', al{:});
-name_line([mdl '/F_x'],   1, 'F_x');
-name_line([mdl '/delta'], 1, 'delta');
+name_line([mdl '/Sw_Fx'],    1, 'F_x');
+name_line([mdl '/Sw_delta'], 1, 'delta');
 name_line(plant, 1, 'state');
 name_line([mdl '/Mux_u'], 1, 'u_in');
 
@@ -107,153 +108,96 @@ end
 
 %% ======================================================================
 function build_plant(plant)
-% Yerlesim: ust sira tekerlek zinciri (Aktuator -> Tekerlek Dinamigi ->
-% Integrator (tekerlek)); sol orta Lastik Modeli + Integrator (kayma) +
-% yuk transferi; sag tarafta S1 cekirdegi (Dinamik sol ust, Integrator
-% (hiz) sag ust, Kinematik sag alt, Integrator (konum) sol alt).
+% Soldan saga tek sira: Yuk Transferi -> Lastik Modeli -> Dinamik Denklem
+% -> Integrator (hiz) -> Kinematik Denklem -> Integrator (konum) -> Mux.
+% Geri beslemeler: v_x, v_y, r (Lastik, Dinamik, Kinematik), psi (Kinematik),
+% a_x (Dinamik -> Memory a_x -> Yuk Transferi; bir adim, cebirsel dongu yok).
+mfb = 'simulink/User-Defined Functions/MATLAB Function';
 
-add_block('built-in/Inport', [plant '/F_x'],   'Position', [30 43 60 57]);
+add_block('built-in/Inport', [plant '/F_x'],   'Position', [30 93 60 107]);
 add_block('built-in/Inport', [plant '/delta'], 'Port', '2', ...
-    'Position', [30 323 60 337]);
+    'Position', [30 223 60 237]);
 
-% --- Aktuator: F_x komutu -> tekerlek torklari ---
-act = [plant '/Aktuator'];
-add_block('simulink/User-Defined Functions/MATLAB Function', act, ...
-    'Position', [140 20 260 100]);
-set_mfunction(act, act_script(), {'R_e', 'brake_split'});
-
-% --- Tekerlek Dinamigi ---
-whl = [plant '/Tekerlek Dinamigi'];
-add_block('simulink/User-Defined Functions/MATLAB Function', whl, ...
-    'Position', [400 20 540 140]);
-set_mfunction(whl, whl_script(), {'tire_mode', 'I_w', 'R_e'});
-
-% --- Integrator (tekerlek): omega >= 0 ---
-wint = [plant '/Integrator (tekerlek)'];
-add_block('built-in/Subsystem', wint, 'Position', [620 30 720 130]);
-build_integrator(wint, {'omega_dot_f','omega_dot_r'}, {'omega_f','omega_r'}, ...
-    {'vx0_init/R_e','vx0_init/R_e'}, {'0','0'});
-
-% --- Lastik Modeli ---
-tyr = [plant '/Lastik Modeli'];
-add_block('simulink/User-Defined Functions/MATLAB Function', tyr, ...
-    'Position', [140 200 340 560]);
-set_mfunction(tyr, tyr_script(), ...
-    {'tire_mode','lf','lr','Cf','Cr','C_kappa','mu','R_e','sigma_x', ...
-     'sigma_y','k_low0','v_low','tau_c','vx_floor','brake_split'});
-
-% --- Integrator (kayma): kappa >= -1 ---
-sint = [plant '/Integrator (kayma)'];
-add_block('built-in/Subsystem', sint, 'Position', [160 640 260 780], ...
-    'Orientation', 'left');
-build_integrator(sint, {'kappa_dot_f','kappa_dot_r','alpha_dot_f','alpha_dot_r'}, ...
-    {'kappa_f','kappa_r','alpha_f','alpha_r'}, {'0','0','0','0'}, {'-1','-1','',''});
-set_param(sint, 'ContentPreviewEnabled', 'off');
-
-% --- a_x filtresi ve Yuk Transferi ---
-add_block('simulink/Continuous/Transfer Fcn', [plant '/Filtre a_x'], ...
-    'Numerator', '1', 'Denominator', '[tau_ax 1]', ...
-    'Position', [440 830 520 870], 'Orientation', 'left');
+% --- Yuk Transferi: onceki adimin a_x'inden aks dusey yukleri ---
 lt = [plant '/Yuk Transferi'];
-add_block('simulink/User-Defined Functions/MATLAB Function', lt, ...
-    'Position', [160 820 280 880], 'Orientation', 'left');
+add_block(mfb, lt, 'Position', [120 70 240 130]);
 set_mfunction(lt, lt_script(), {'m','g','lf','lr','L','h'});
+add_block('built-in/Memory', [plant '/Memory a_x'], 'InitialCondition', '0', ...
+    'Position', [400 370 440 400], 'Orientation', 'left');
 
-% --- Dinamik Denklem (S1 cekirdegi sol ust) ---
+% --- Lastik Modeli: dagitim, kirpma, Dugoff ---
+tyr = [plant '/Lastik Modeli'];
+add_block(mfb, tyr, 'Position', [320 60 480 320]);
+set_mfunction(tyr, tyr_script(), ...
+    {'lf','lr','Cf','Cr','mu','vx_floor','brake_split'});
+
+% --- Dinamik Denklem ---
 dyn = [plant '/Dinamik Denklem'];
-add_block('simulink/User-Defined Functions/MATLAB Function', dyn, ...
-    'Position', [480 220 680 460]);
+add_block(mfb, dyn, 'Position', [560 60 720 320]);
 set_mfunction(dyn, dyn_script(), ...
-    {'m','Iz','lf','lr','rho_air','CdA','C_rr','g','theta_road', ...
-     'tire_mode','v_eps'});
+    {'m','Iz','lf','lr','rho_air','CdA','C_rr','g','theta_road'});
 
-% --- Integrator (hiz) (sag ust) ---
+% --- Integrator (hiz): v_x >= 0 ---
 vint = [plant '/Integrator (hiz)'];
-add_block('built-in/Subsystem', vint, 'Position', [800 250 920 390]);
+add_block('built-in/Subsystem', vint, 'Position', [800 110 900 260]);
 build_integrator(vint, {'vx_dot','vy_dot','r_dot'}, {'v_x','v_y','r'}, ...
-    {'vx0_init','vy0_init','r0_init'}, {'0 - 1e300*(tire_mode ~= 0)','',''});
-% v_x alt siniri: notlar modunda 0 (S1), tam modda yok (-1e300). Ifade
-% notlar modunda tam +0 verir (-inf*0 = NaN tuzagi yok).
+    {'vx0_init','vy0_init','r0_init'}, {'0','',''});
 
-% --- Kinematik Denklem (sag alt, sola bakar) ---
+% --- Kinematik Denklem ---
 kin = [plant '/Kinematik Denklem'];
-add_block('simulink/User-Defined Functions/MATLAB Function', kin, ...
-    'Position', [780 560 940 700], 'Orientation', 'left');
+add_block(mfb, kin, 'Position', [980 110 1120 270]);
 set_mfunction(kin, kin_script(), {});
 
-% --- Integrator (konum) (sol alt, sola bakar) ---
+% --- Integrator (konum) ---
 pint = [plant '/Integrator (konum)'];
-add_block('built-in/Subsystem', pint, 'Position', [500 570 620 690], ...
-    'Orientation', 'left');
+add_block('built-in/Subsystem', pint, 'Position', [1200 110 1300 260]);
 build_integrator(pint, {'X_dot','Y_dot','psi_dot'}, {'X','Y','psi'}, ...
     {'X0','Y0','psi0'}, {'','',''});
-set_param(pint, 'ContentPreviewEnabled', 'off');
 
 % --- Cikis: durum vektoru [X Y psi vx vy r] ---
-% Yeni buyuklukler ve turevler cizgi yerine sinyal loglamasiyla (logsout).
 add_block('built-in/Mux', [plant '/Mux_state'], 'Inputs', '6', ...
-    'Position', [1060 360 1065 580]);
-add_block('built-in/Outport', [plant '/state'], 'Position', [1130 463 1160 477]);
+    'Position', [1400 80 1405 380]);
+add_block('built-in/Outport', [plant '/state'], 'Position', [1460 223 1490 237]);
 
 al = {'autorouting', 'smart'};
-A = 'Aktuator'; W = 'Tekerlek Dinamigi'; WI = 'Integrator (tekerlek)';
-T = 'Lastik Modeli'; SI = 'Integrator (kayma)';
-F = 'Filtre a_x'; LT = 'Yuk Transferi';
-D = 'Dinamik Denklem'; V = 'Integrator (hiz)';
-K = 'Kinematik Denklem'; P = 'Integrator (konum)';
+LT = 'Yuk Transferi'; T = 'Lastik Modeli'; D = 'Dinamik Denklem';
+V = 'Integrator (hiz)'; K = 'Kinematik Denklem'; P = 'Integrator (konum)';
 ln = @(src, sp, dst, dp) add_line(plant, sprintf('%s/%d', src, sp), ...
     sprintf('%s/%d', dst, dp), al{:});
 
-% girisler
-ln('F_x', 1, A, 1);
+ln(D, 4, 'Memory a_x', 1);
+ln('Memory a_x', 1, LT, 1);
 ln('F_x', 1, T, 1);
 ln('delta', 1, T, 2);
 ln('delta', 1, D, 5);
-% Aktuator -> Tekerlek Dinamigi -> Integrator (tekerlek) -> Lastik Modeli
-ln(A, 1, W, 1); ln(A, 2, W, 2);
-ln(W, 1, WI, 1); ln(W, 2, WI, 2);
-ln(WI, 1, T, 6); ln(WI, 2, T, 7);
-% Lastik Modeli -> Dinamik Denklem [F_xf F_yf F_xr F_yr], Tekerlek Dinamigi [F_xf F_xr]
+ln(LT, 1, T, 6); ln(LT, 2, T, 7);
 for i = 1:4, ln(T, i, D, i); end
-ln(T, 1, W, 3); ln(T, 3, W, 4);
-% Lastik Modeli <-> Integrator (kayma)
-for i = 1:4, ln(T, i + 4, SI, i); ln(SI, i, T, i + 7); end
-% Dinamik a_x -> Filtre -> Yuk Transferi -> Lastik Modeli
-ln(D, 4, F, 1); ln(F, 1, LT, 1);
-ln(LT, 1, T, 12); ln(LT, 2, T, 13);
-% S1 cekirdegi
-for i = 1:3, ln(D, i, V, i); end
 for i = 1:3
+    ln(D, i, V, i);
+    ln(V, i, T, i + 2);
     ln(V, i, D, i + 5);
     ln(V, i, K, i);
-    ln(V, i, T, i + 2);
+    ln(K, i, P, i);
+    ln(P, i, 'Mux_state', i);
+    ln(V, i, 'Mux_state', i + 3);
 end
-for i = 1:3, ln(K, i, P, i); end
 ln(P, 3, K, 4);
-for i = 1:3, ln(P, i, 'Mux_state', i); end
-for i = 1:3, ln(V, i, 'Mux_state', i + 3); end
 ln('Mux_state', 1, 'state', 1);
 
 % sinyal adlari; logla = true olanlar logsout'a
 sig = {
-    D,  {'vx_dot','vy_dot','r_dot','a_x'},               true
-    V,  {'v_x','v_y','r'},                                false
-    K,  {'X_dot','Y_dot','psi_dot'},                      true
-    P,  {'X','Y','psi'},                                  false
-    A,  {'T_f','T_r'},                                    true
-    W,  {'omega_dot_f','omega_dot_r'},                    false
-    WI, {'omega_f','omega_r'},                            true
-    T,  {'F_xf','F_yf','F_xr','F_yr', ...
-         'kappa_dot_f','kappa_dot_r','alpha_dot_f','alpha_dot_r'}, true
-    SI, {'kappa_f','kappa_r','alpha_f','alpha_r'},        true
-    F,  {'a_x_f'},                                        true
-    LT, {'F_zf','F_zr'},                                  true
+    LT, {'F_zf','F_zr'},                   true
+    T,  {'F_xf','F_yf','F_xr','F_yr'},     true
+    D,  {'vx_dot','vy_dot','r_dot','a_x'}, true
+    V,  {'v_x','v_y','r'},                 false
+    K,  {'X_dot','Y_dot','psi_dot'},       true
+    P,  {'X','Y','psi'},                   false
     };
 for k = 1:size(sig, 1)
     ph = get_param([plant '/' sig{k, 1}], 'PortHandles');
     for i = 1:numel(sig{k, 2})
         set_param(get_param(ph.Outport(i), 'Line'), 'Name', sig{k, 2}{i});
-        if sig{k, 3} && ~startsWith(sig{k, 2}{i}, {'kappa_dot', 'alpha_dot'})
+        if sig{k, 3}
             set_param(ph.Outport(i), 'DataLogging', 'on');
         end
     end
@@ -359,6 +303,61 @@ name_line([mdl '/Mux_ref'], 1, 'ref_pt');
 name_line([mdl '/Bitis'], 1, 'done');
 end
 
+function build_s3(mdl, tw)
+% S3: Lateral C ve Longitudinal C (ayrik, Ts_ctrl). Her biri: ZOH(state) ->
+% MATLAB Function (lat_mpc / lon_mpc, extrinsic) <-> Unit Delay (onceki
+% komut, IC 0). ctrl_enable Switch'leri plant girisini secer.
+al  = {'autorouting', 'smart'};
+mfb = 'simulink/User-Defined Functions/MATLAB Function';
+c = {'Lateral C',      {'e', 's_proj', 'state'},          {'delta', 'flag'}, lat_script(), 'mpc_lat', 360;
+     'Longitudinal C', {'e', 's_ref', 's_proj', 'state'}, {'F_x', 'flag'},   lon_script(), 'mpc_lon', 200};
+for i = 1:2
+    sb = [mdl '/' c{i,1}];  ni = numel(c{i,2});
+    add_block('built-in/Subsystem', sb, 'Position', [960 c{i,6} 1120 c{i,6} + 100]);
+    add_ports(sb, c{i,2}, c{i,3}, 520);
+    add_block('simulink/Discrete/Zero-Order Hold', [sb '/ZOH'], 'SampleTime', 'Ts_ctrl', ...
+        'Position', [110 35 + 70*(ni-1) 145 65 + 70*(ni-1)]);
+    add_block(mfb, [sb '/MPC'], 'Position', [220 30 380 230]);
+    set_s2_mfunction([sb '/MPC'], c{i,4}, {'ref', c{i,5}, 'Ts_ctrl'});
+    add_block('built-in/UnitDelay', [sb '/z_u'], 'InitialCondition', '0', ...
+        'SampleTime', 'Ts_ctrl', 'Position', [280 290 320 320], 'Orientation', 'left');
+    for j = 1:ni - 1, add_line(sb, sprintf('%s/1', c{i,2}{j}), sprintf('MPC/%d', j), al{:}); end
+    add_line(sb, 'state/1', 'ZOH/1', al{:});
+    add_line(sb, 'ZOH/1', sprintf('MPC/%d', ni), al{:});
+    add_line(sb, 'z_u/1', sprintf('MPC/%d', ni + 1), al{:});
+    add_line(sb, 'MPC/1', 'z_u/1', al{:});
+    for j = 1:2, add_line(sb, sprintf('MPC/%d', j), [c{i,3}{j} '/1'], al{:}); end
+end
+add_line(mdl, 'Hata Hesabi/1', 'Lateral C/1', al{:});
+add_line(mdl, 'Hata Hesabi/3', 'Lateral C/2', al{:});
+add_line(mdl, 'Plant/1', 'Lateral C/3', al{:});
+add_line(mdl, 'Hata Hesabi/1', 'Longitudinal C/1', al{:});
+add_line(mdl, 'Referans/1', 'Longitudinal C/2', al{:});
+add_line(mdl, 'Hata Hesabi/3', 'Longitudinal C/3', al{:});
+add_line(mdl, 'Plant/1', 'Longitudinal C/4', al{:});
+
+% ctrl_enable: 1 -> MPC, 0 -> From Workspace test girisleri
+add_block('simulink/Sources/Constant', [mdl '/ctrl_enable'], 'Value', 'ctrl_enable', ...
+    'Position', [40 200 100 220]);
+sw = {'Sw_Fx', 'Longitudinal C', 'F_x', [180 60 210 100]; 'Sw_delta', 'Lateral C', 'delta', [180 130 210 170]};
+for i = 1:2
+    add_block('simulink/Signal Routing/Switch', [mdl '/' sw{i,1}], 'Criteria', 'u2 >= Threshold', ...
+        'Threshold', '0.5', 'Position', sw{i,4});
+    add_line(mdl, [sw{i,2} '/1'], [sw{i,1} '/1'], al{:});
+    add_line(mdl, 'ctrl_enable/1', [sw{i,1} '/2'], al{:});
+    add_line(mdl, [sw{i,3} '/1'], [sw{i,1} '/3'], al{:});
+end
+lg = {'Lateral C', 1, 'delta_cmd'; 'Lateral C', 2, 'flag_lat';
+      'Longitudinal C', 1, 'Fx_cmd'; 'Longitudinal C', 2, 'flag_lon'};
+for i = 1:4
+    y = 760 + (i - 1)*45;
+    add_block('simulink/Sinks/To Workspace', [mdl '/log_' lg{i,3}], ...
+        'VariableName', lg{i,3}, tw{:}, 'Position', [800 y 880 y + 24]);
+    add_line(mdl, sprintf('%s/%d', lg{i,1}, lg{i,2}), ['log_' lg{i,3} '/1'], al{:});
+    name_line([mdl '/' lg{i,1}], lg{i,2}, lg{i,3});
+end
+end
+
 function add_ports(sub, ins, outs, xo)
 % alt sistem giris / cikis portlari (sirali)
 for i = 1:numel(ins)
@@ -383,12 +382,15 @@ for k = 1:numel(params)
     d = ch.find('-isa', 'Stateflow.Data', 'Name', params{k});
     d.Tunable = false;
 end
+% cikislar acikca skaler: kapali dongude (S3) Unit Delay geri beslemeleri
+% boyut yayilimini belirsiz birakir (vektor cikislar sonradan ayarlanir)
+o = ch.find('-isa', 'Stateflow.Data', 'Scope', 'Output');
+for k = 1:numel(o), o(k).Props.Array.Size = '1'; end
 end
 
 %% ======================================================================
 function build_integrator(sub, in_names, out_names, ics, lower)
-% Ayri surekli Integrator'lar; lower{i} bos degilse alt sinir (v_x >= 0,
-% omega >= 0, kappa >= -1).
+% Ayri surekli Integrator'lar; lower{i} bos degilse alt sinir (v_x >= 0).
 for i = 1:numel(in_names)
     y = 30 + (i - 1)*60;
     add_block('built-in/Inport', [sub '/' in_names{i}], 'Port', num2str(i), ...
@@ -426,158 +428,59 @@ set_param(get_param(ph.Outport(port), 'Line'), 'Name', name);
 end
 
 %% ======================================================================
-function s = act_script()
+function s = lt_script()
 s = strjoin({
-'function [T_f, T_r] = fcn(F_x, R_e, brake_split)'
-'% Aktuator: F_x komutu [N] -> aks torklari [N m]. Itis yalniz arkadan;'
-'% fren brake_split ile on/arka (fren torku negatif, donuse karsi koyar).'
-'if F_x >= 0'
-'    T_f = 0;'
-'    T_r = F_x*R_e;'
-'else'
-'    T_f = brake_split*F_x*R_e;'
-'    T_r = (1 - brake_split)*F_x*R_e;'
-'end'
-}, newline);
-end
-
-function s = whl_script()
-s = strjoin({
-'function [omega_dot_f, omega_dot_r] = fcn(T_f, T_r, F_xf, F_xr, tire_mode, I_w, R_e)'
-'% Tekerlek Dinamigi: I_w*omega_dot = T - R_e*F_x,lastik (aks basina).'
-'% Notlar modunda (tire_mode = 0) omega sabit kalir (kullanilmaz).'
-'if tire_mode == 0'
-'    omega_dot_f = 0;'
-'    omega_dot_r = 0;'
-'else'
-'    omega_dot_f = (T_f - R_e*F_xf)/I_w;'
-'    omega_dot_r = (T_r - R_e*F_xr)/I_w;'
-'end'
+'function [F_zf, F_zr] = fcn(a_x, m, g, lf, lr, L, h)'
+'% Yuk Transferi: aks dusey yukleri (>= 0); a_x govde boyuna ivmesi,'
+'% Memory a_x uzerinden bir adim (Ts_plant) gecikmeli.'
+'F_zf = max((m*g*lr - m*a_x*h)/L, 0);'
+'F_zr = max((m*g*lf + m*a_x*h)/L, 0);'
 }, newline);
 end
 
 function s = tyr_script()
 s = strjoin({
-'function [F_xf, F_yf, F_xr, F_yr, kappa_dot_f, kappa_dot_r, alpha_dot_f, alpha_dot_r] = fcn(F_x, delta, v_x, v_y, r, omega_f, omega_r, kappa_f, kappa_r, alpha_f, alpha_r, F_zf, F_zr, tire_mode, lf, lr, Cf, Cr, C_kappa, mu, R_e, sigma_x, sigma_y, k_low0, v_low, tau_c, vx_floor, brake_split)'
-'% Lastik Modeli. Kuvvetler teker cercevesinde, aks basina (iki teker toplu).'
-'% tire_mode = 0 (notlar, S1): F_x dogrudan dagitilir, lineer lastik, anlik'
-'%                atan kayma; kayma durumlari sabit kalir (turev 0).'
-'% tire_mode = 1 (tam): gecici kayma (gevseme uzunlugu) + dusuk hiz sonumu'
-'%                + dusuk hizda doyma cekisi + yon duzeltmeli Dugoff.'
-'if tire_mode == 0'
-'    if F_x >= 0'
-'        F_xf = 0;'
-'        F_xr = F_x;'
-'    else'
-'        F_xf = brake_split*F_x;'
-'        F_xr = (1 - brake_split)*F_x;'
-'    end'
-'    vx_hat = max(v_x, vx_floor);'
-'    a_f = delta - atan((v_y + lf*r)/vx_hat);'
-'    a_r = -atan((v_y - lr*r)/vx_hat);'
-'    F_yf = Cf*a_f;'
-'    F_yr = Cr*a_r;'
-'    kappa_dot_f = 0;'
-'    kappa_dot_r = 0;'
-'    alpha_dot_f = 0;'
-'    alpha_dot_r = 0;'
+'function [F_xf, F_yf, F_xr, F_yr] = fcn(F_x, delta, v_x, v_y, r, F_zf, F_zr, lf, lr, Cf, Cr, mu, vx_floor, brake_split)'
+'% Lastik Modeli: kuvvetler teker cercevesinde, aks basina (iki teker toplu).'
+'% Itis yalniz arkadan; fren brake_split ile on/arka.'
+'if F_x >= 0'
+'    F_xf = 0;'
+'    F_xr = F_x;'
 'else'
-'    % teker cercevesi hizlari'
-'    vwx_f =  v_x*cos(delta) + (v_y + lf*r)*sin(delta);'
-'    vwy_f = -v_x*sin(delta) + (v_y + lf*r)*cos(delta);'
-'    vwx_r =  v_x;'
-'    vwy_r =  v_y - lr*r;'
-'    % gecici kayma: sigma*x_dot + |v_wx|*x = kayma hizi'
-'    kappa_dot_f = (R_e*omega_f - vwx_f - abs(vwx_f)*kappa_f)/sigma_x;'
-'    kappa_dot_r = (R_e*omega_r - vwx_r - abs(vwx_r)*kappa_r)/sigma_x;'
-'    alpha_dot_f = (-vwy_f - abs(vwx_f)*alpha_f)/sigma_y;'
-'    alpha_dot_r = (-vwy_r - abs(vwx_r)*alpha_r)/sigma_y;'
-'    % dusuk hiz agirligi w in [0,1]: |v_wx| < v_low bolgesinde etkin'
-'    wf = w_lowspeed(vwx_f, v_low);'
-'    wr = w_lowspeed(vwx_r, v_low);'
-'    % doyma cekisi: dusuk hizda kayma durumu lastik deformasyonudur'
-'    % (u = sigma*kappa); deformasyon kayma esigini (mu*F_z/C) asamaz.'
-'    kappa_dot_f = kappa_dot_f - wf*sat_excess(kappa_f, mu*F_zf/C_kappa)/tau_c;'
-'    kappa_dot_r = kappa_dot_r - wr*sat_excess(kappa_r, mu*F_zr/C_kappa)/tau_c;'
-'    alpha_dot_f = alpha_dot_f - wf*sat_excess(alpha_f, mu*F_zf/Cf)/tau_c;'
-'    alpha_dot_r = alpha_dot_r - wr*sat_excess(alpha_r, mu*F_zr/Cr)/tau_c;'
-'    % dusuk hiz sonumu (Pacejka k_Vlow formu) ile efektif kayma'
-'    kf = k_low0*wf;'
-'    kr = k_low0*wr;'
-'    ke_f = max(kappa_f + kf/C_kappa*(R_e*omega_f - vwx_f), -1);'
-'    ke_r = max(kappa_r + kr/C_kappa*(R_e*omega_r - vwx_r), -1);'
-'    te_f = alpha_f - kf/Cf*vwy_f;'
-'    te_r = alpha_r - kr/Cr*vwy_r;'
-'    [F_xf, F_yf] = dugoff(ke_f, te_f, F_zf, C_kappa, Cf, mu);'
-'    [F_xr, F_yr] = dugoff(ke_r, te_r, F_zr, C_kappa, Cr, mu);'
+'    F_xf = brake_split*F_x;'
+'    F_xr = (1 - brake_split)*F_x;'
 'end'
+'% surtunme cemberi: once boyuna kirpilir, kalan pay yanal tavandir'
+'F_xf = min(max(F_xf, -mu*F_zf), mu*F_zf);'
+'F_xr = min(max(F_xr, -mu*F_zr), mu*F_zr);'
+'% kayma acilari (S1 notlar), bolme tabani vx_floor'
+'vx_hat = max(v_x, vx_floor);'
+'a_f = delta - atan((v_y + lf*r)/vx_hat);'
+'a_r = -atan((v_y - lr*r)/vx_hat);'
+'F_yf = dugoff(a_f, Cf, sqrt(max((mu*F_zf)^2 - F_xf^2, 0)));'
+'F_yr = dugoff(a_r, Cr, sqrt(max((mu*F_zr)^2 - F_xr^2, 0)));'
 'end'
 ''
-'function w = w_lowspeed(vwx, v_low)'
-'% Dusuk hiz agirligi: |v_wx| = 0 iken 1, |v_wx| >= v_low iken 0 (kosinus).'
-'V = abs(vwx);'
-'if V < v_low'
-'    w = 0.5*(1 + cos(pi*V/v_low));'
+'function F = dugoff(a, C, Fmax)'
+'% Yanal Dugoff (Rajamani 13, kappa yok), S = C|tan a|: 2S <= Fmax dogrusal,'
+'% degilse doymus. Fmax = 0 iken F = 0 (S = 0 dogrusal kol, S > 0 doymus kol).'
+'S = C*abs(tan(a));'
+'if 2*S <= Fmax'
+'    F = C*tan(a);'
 'else'
-'    w = 0;'
+'    F = sign(a)*Fmax*(1 - Fmax/(4*S));'
 'end'
 'end'
-''
-'function e = sat_excess(x, xs)'
-'% x''in [-xs, xs] disinda kalan kismi: x - clamp(x, -xs, xs).'
-'e = x - min(max(x, -xs), xs);'
-'end'
-''
-'function [Fx, Fy] = dugoff(kap, t, Fz, Cx, Cy, mu)'
-'% Yon duzeltmeli Dugoff, t = tan(alpha). lambda >= 1: Rajamani 13. bolum'
-'% lineer bolge. lambda < 1: buyukluk Dugoff (|F| = mu*F_z*(2-lambda)/2,'
-'% (1+kappa) sadelesmis, kappa = -1 icin 0/0 yok); yon lambda agirligiyla'
-'% Dugoff yonunden (Cx*kap, Cy*t)/S kayma hizinin tersine (kap, t)/n karisir.'
-'u = 1 + kap;'
-'S = sqrt((Cx*kap)^2 + (Cy*t)^2);'
-'n = sqrt(kap^2 + t^2);'
-'if 2*S <= mu*Fz*u'
-'    Fx = Cx*kap/u;'
-'    Fy = Cy*t/u;'
-'elseif n == 0'
-'    Fx = 0;   % erisilemez (S > 0 => n > 0); guvenli dal'
-'    Fy = 0;'
-'else'
-'    lam = mu*Fz*u/(2*S);'
-'    Fm  = mu*Fz*(2 - lam)/2;'
-'    ex  = lam*Cx*kap/S + (1 - lam)*kap/n;'
-'    ey  = lam*Cy*t/S   + (1 - lam)*t/n;'
-'    e   = sqrt(ex^2 + ey^2);'
-'    Fx  = Fm*ex/e;'
-'    Fy  = Fm*ey/e;'
-'end'
-'end'
-}, newline);
-end
-
-function s = lt_script()
-s = strjoin({
-'function [F_zf, F_zr] = fcn(a_x_f, m, g, lf, lr, L, h)'
-'% Yuk Transferi: filtrelenmis a_x ile aks dusey yukleri (>= 0).'
-'F_zf = max((m*g*lr - m*a_x_f*h)/L, 0);'
-'F_zr = max((m*g*lf + m*a_x_f*h)/L, 0);'
 }, newline);
 end
 
 function s = dyn_script()
 s = strjoin({
-'function [vx_dot, vy_dot, r_dot, a_x] = fcn(F_xf, F_yf, F_xr, F_yr, delta, v_x, v_y, r, m, Iz, lf, lr, rho_air, CdA, C_rr, g, theta_road, tire_mode, v_eps)'
+'function [vx_dot, vy_dot, r_dot, a_x] = fcn(F_xf, F_yf, F_xr, F_yr, delta, v_x, v_y, r, m, Iz, lf, lr, rho_air, CdA, C_rr, g, theta_road)'
 '% Dinamik Denklem: tam form govde denklemleri (Rajamani 2.3), lastik'
 '% kuvvetleri (teker cercevesi, aks basina) Lastik Modeli''nden gelir.'
-''
-'% Direnc: hava + yuvarlanma + egim. Notlar modu S1 ifadesi (v_x >= 0);'
-'% tam modda v_x sinirsiz oldugundan yone duyarli (durgunda F_res = egim).'
-'if tire_mode == 0'
-'    F_res = 0.5*rho_air*CdA*v_x^2 + C_rr*m*g*cos(theta_road) + m*g*sin(theta_road);'
-'else'
-'    F_res = 0.5*rho_air*CdA*v_x*abs(v_x) + C_rr*m*g*cos(theta_road)*tanh(v_x/v_eps) + m*g*sin(theta_road);'
-'end'
-''
+'% Direnc: hava + yuvarlanma + egim (S1; v_x >= 0).'
+'F_res = 0.5*rho_air*CdA*v_x^2 + C_rr*m*g*cos(theta_road) + m*g*sin(theta_road);'
 'vx_dot = (F_xf*cos(delta) - F_yf*sin(delta) + F_xr - F_res)/m + v_y*r;'
 'vy_dot = (F_yf*cos(delta) + F_xf*sin(delta) + F_yr)/m - v_x*r;'
 'r_dot  = (lf*(F_yf*cos(delta) + F_xf*sin(delta)) - lr*F_yr)/Iz;'
@@ -622,6 +525,26 @@ s = strjoin({
 '% Bitis Mantigi: tur (s_veh - s0 >= n_laps L) ya da t_hold boyunca'
 '% hypot(v_x, v_y) < v_stop; stop_enable = 0 iken hic bitmez (ref_done).'
 '[done, n_slow] = ref_done(s_veh, x(4), x(5), n_slow_prev, stop_enable, ref, fin, Ts_ctrl);'
+}, newline);
+end
+
+function s = lat_script()
+s = strjoin({
+'function [delta, flag] = fcn(e, s_proj, x, delta_prev, ref, mpc_lat, Ts_ctrl)'
+'% Lateral C: yanal MPC (lat_mpc, MATLAB''da calisir; quadprog).'
+'coder.extrinsic(''lat_mpc'');'
+'delta = 0;  flag = 0;'
+'[delta, flag] = lat_mpc(e, s_proj, x(4), delta_prev, ref, mpc_lat, Ts_ctrl);'
+}, newline);
+end
+
+function s = lon_script()
+s = strjoin({
+'function [F_x, flag] = fcn(e, s_ref, s_proj, x, F_prev, ref, mpc_lon, Ts_ctrl)'
+'% Longitudinal C: boyuna MPC (lon_mpc, MATLAB''da calisir; quadprog).'
+'coder.extrinsic(''lon_mpc'');'
+'F_x = 0;  flag = 0;'
+'[F_x, flag] = lon_mpc(e(1), s_ref, s_proj, x(4), x(4)*x(6), F_prev, ref, mpc_lon, Ts_ctrl);'
 }, newline);
 end
 

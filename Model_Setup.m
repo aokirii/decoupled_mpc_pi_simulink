@@ -1,4 +1,4 @@
-%% Model_Setup.m -- VehicleDiagram.slx parametreleri (S1 Plant, S2 Referans + Hata Hesabi)
+%% Model_Setup.m -- VehicleDiagram.slx parametreleri (S1 Plant, S2 Referans + Hata Hesabi, S3 MPC)
 % Tum degiskenler base workspace'e yazilir. Testler bu betigi calistirip
 % degiskenleri (base'te) ezdikten sonra sim('VehicleDiagram') cagirabilir.
 % Not: bilincli olarak 'clear' yok; bir fonksiyon icinden cagrilinca
@@ -26,31 +26,13 @@ theta_road = 0;       % yol egimi [rad] (+ = yokus yukari)
 %% --- Plant ayarlari ---
 vx_floor    = 1;      % kayma acisinda bolme tabani [m/s]
 brake_split = 0.6;    % on aks fren payi (F_x < 0); itis yalniz arkadan
-
-%% --- Lastik modeli (S1b) ---
-% tire_mode = 0: "notlar" (S1: F_x dogrudan dagitilir, lineer lastik, anlik
-%                atan kayma, vx_floor); 1: "tam" (aktuator + tekerlek
-%                dinamigi + gecici kayma + Dugoff + yuk transferi).
-tire_mode = 1;
-R_e      = 0.3;       % efektif yuvarlanma yaricapi [m] (Simscape Driveline Tire (Magic Formula) varsayilani r_e)
-I_w      = 2*1.0;     % aks basina tekerlek ataleti [kg m^2] (teker basina 1, ayni bilesenin varsayilani)
-C_kappa  = 19*m*g/2;  % aks basina boyuna kayma rijitligi [N] = B*C*D*F_z; B=10, C=1.9, D=1: bilesenin 'constant coefficients' parametrelemesi varsayilani (bkz. belge)
-c_x      = 2*1e6;     % aks basina boyuna karkas rijitligi [N/m] (teker basina 1e6, ayni bilesenin compliance varsayilani)
-sigma_x  = C_kappa/c_x;   % boyuna gevseme uzunlugu [m] (Pacejka: sigma_kappa = C_Fkappa / C_Fx)
-sigma_y  = 0.3;       % yanal gevseme uzunlugu [m] (tekerlek yaricapi mertebesi, bkz. belge)
-mu       = 0.75;      % yol tutus katsayisi (lonlat)
-h        = 0.55;      % CG yuksekligi [m] (lonlat, yuk transferi)
-tau_ax   = 0.1;       % a_x filtresi zaman sabiti [s] (govde pitch modu ~1.5 Hz, bkz. belge)
-k_low0   = 13000;     % dusuk hiz sonum katsayisi [N s/m] (Pacejka k_Vlow formu, bkz. belge)
-v_low    = 1;         % dusuk hiz bolgesi siniri [m/s] (sonum ve doyma cekisi bunun altinda)
-tau_c    = 0.02;      % dusuk hiz doyma cekisi zaman sabiti [s] (bkz. belge)
-v_eps    = 0.02;      % tam modda yuvarlanma direnci tanh(v_x/v_eps) gecis hizi [m/s]; Coulomb'a yakin:
-                      % kilit sonrasi fren birakmada kayma 1.3 mm (0.1 ile 5.9 mm); viskoz egim C_rr*m*g/v_eps -> h*lambda ~ 0.007
+mu          = 0.75;   % yol tutus katsayisi (lonlat; Dugoff doymasi, surtunme cemberi)
+h           = 0.55;   % CG yuksekligi [m] (lonlat, yuk transferi)
 
 %% --- Simulasyon ---
 Ts_plant = 1e-3;      % sabit adim [s] (ode4)
 Ts_ctrl  = 0.02;      % kontrol / referans ornekleme suresi [s] (Ts_plant'in tam kati)
-T_end    = 20;        % bitis zamani [s]
+T_end    = 300;       % ust sinir [s]; kapali dongude kosu Bitis blogunda biter (3 tur: Rectangle 134 s, Circle 283 s)
 
 %% --- Referans yol ve hata hesabi (S2) ---
 % Harita -> interpolasyon yontemi / kose yaricapi (diyagram-simulink-matematik.md 3.2)
@@ -63,14 +45,25 @@ switch map_name
 end
 [waypoints, startPt] = ms_load_map__(fullfile(fileparts(mfilename('fullpath')), 'maps', ms_map__{1}));
 prm_ref = struct('ds_target', 0.1, 'corner_radius', ms_map__{3}, ...
-                 'interp_method', ms_map__{2}, 'v_max', 8, 'ay_max', 0.85*mu*g, ...
-                 'ax_max', 3, 'ax_min', -6, 'v_min', 2, 'kappa_win', 3);
+                 'interp_method', ms_map__{2}, 'v_max', 8, 'ay_max', 0.3*g, ...   % olagan surus: a_y 0.3 g, fren -2, hizlanma 1.5 m/s^2
+                 'ax_max', 1.5, 'ax_min', -2, 'v_min', 2, 'kappa_win', 3);
 clear ms_map__
 ref = reference_path(waypoints, startPt, prm_ref);   % yol uzunlugu ref.L (L = dingil mesafesi)
 win_fwd  = 120;       % en yakin nokta arama penceresi, ileri [dugum]
 win_back = 20;        % geri [dugum]
 fin = struct('n_laps', 3, 'v_stop', 0.05, 't_hold', 0.5);   % bitis olcutleri (Ts = Ts_ctrl ayri)
 stop_enable = 1;      % 0: bitis mantigi kapali (plant testleri)
+
+%% --- Kontrolculer (S3) ---
+ctrl_enable = 1;      % 1: MPC komutlari plant'a; 0: test girisleri (Fx_in, delta_in)
+% Yanal MPC: x = [e_y e_y' (e_psi - e_psi,ss) e_psi'], giris delta (lat_mpc)
+mpc_lat = struct('Np', 30, 'Q', diag([70 10 150 30]), 'R', 0, 'Rd', 1, ...
+    'ulim', deg2rad([-30 30]), 'dumax', 1.5*Ts_ctrl, 'isoft', 0, 'ws', 1, ...
+    'vx_floor', vx_floor, 'Cf', Cf, 'Cr', Cr, 'lf', lf, 'lr', lr, 'm', m, 'Iz', Iz);
+% Boyuna MPC: x = [e_x e_v], giris a = F_x/m; yumusak sinir v_x <= yol hizi (isoft = 2)
+mpc_lon = struct('Np', 30, 'Q', diag([150 10]), 'R', 0, 'Rd', 1, ...
+    'ulim', [-3 2], 'dumax', 2.5*Ts_ctrl, 'isoft', 2, 'ws', 1e4, ...   % olagan surus: jerk 2.5 m/s^3
+    'ay_lim', 0.75*mu*g, 'lr', lr, 'lf', lf, 'Cf', Cf, 'Cr', Cr, 'm', m, 'rho_air', rho_air, 'CdA', CdA, 'C_rr', C_rr, 'g', g);
 
 %% --- Baslangic kosullari ---
 vx0_init = ref.v(ref.idx0);   % boyuna hiz [m/s] (hiz profilinden)
@@ -87,13 +80,12 @@ delta_in = [0 0;   T_end 0];     % on teker direksiyon acisi [rad]
 %% --- Workspace ---
 ms_names__ = {'m','Iz','L','lr','lf','Cf','Cr', ...
          'rho_air','CdA','C_rr','g','theta_road', ...
-         'vx_floor','brake_split','Ts_plant','T_end', ...
-         'tire_mode','R_e','I_w','C_kappa','c_x','sigma_x','sigma_y', ...
-         'mu','h','tau_ax','k_low0','v_low','tau_c','v_eps', ...
+         'vx_floor','brake_split','mu','h','Ts_plant','T_end', ...
          'vx0_init','vy0_init','r0_init','X0','Y0','psi0', ...
          'Fx_in','delta_in', ...
          'Ts_ctrl','map_name','waypoints','startPt','prm_ref','ref', ...
-         'win_fwd','win_back','fin','stop_enable'};
+         'win_fwd','win_back','fin','stop_enable', ...
+         'ctrl_enable','mpc_lat','mpc_lon'};
 % Dongu/liste degiskenleri cagiranin degiskenleriyle cakismasin diye
 % benzersiz adli; yalniz bunlar temizlenir.
 for ms_i__ = 1:numel(ms_names__)

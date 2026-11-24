@@ -1,6 +1,6 @@
 function test_ref_wiring()
 %TEST_REF_WIRING  S2 Simulink entegrasyon testi (Referans, Hata Hesabi, Bitis).
-%   (a) Kablolama: tam lastik modu, Rectangle baslangici, acik cevrim
+%   (a) Kablolama: sade plant (Dugoff), Rectangle baslangici, acik cevrim
 %       (F_x = 300 N, delta = 0.03 sin 0.7t), 8 s, stop_enable = 0. Plant
 %       durumu 0.02 s anlarinda logdan alinir; ref_advance, ref_error ve
 %       ref_done MATLAB'da ayni geri besleme sirasiyla (Unit Delay: s_ref
@@ -121,6 +121,7 @@ in = in.setVariable('T_end', Tend);
 in = in.setVariable('Fx_in', Ftab);
 in = in.setVariable('delta_in', dtab);
 in = in.setVariable('stop_enable', stop_en);
+in = in.setVariable('ctrl_enable', 0);   % acik cevrim (S3 MPC devre disi)
 if ~isempty(fin), in = in.setVariable('fin', fin); end
 out = sim(in);
 end
