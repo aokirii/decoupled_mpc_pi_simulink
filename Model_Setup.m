@@ -1,6 +1,6 @@
 %% Model_Setup.m -- VehicleDiagram.slx parametreleri (S1 Plant, S2 Referans + Hata Hesabi, S3 MPC)
-% Tum degiskenler base workspace'e yazilir. Testler bu betigi calistirip
-% degiskenleri (base'te) ezdikten sonra sim('VehicleDiagram') cagirabilir.
+% Tum degiskenler base workspace'e yazilir. Calistirdiktan sonra degiskenler
+% (base'te) ezilerek sim('VehicleDiagram') cagrilabilir.
 % Not: bilincli olarak 'clear' yok; bir fonksiyon icinden cagrilinca
 % cagiranin calisma alanini silmesin.
 % Harita: map_name ('Circle' | 'Rectangle' | 'Hand') cagiranin calisma
@@ -52,10 +52,9 @@ ref = reference_path(waypoints, startPt, prm_ref);   % yol uzunlugu ref.L (L = d
 win_fwd  = 120;       % en yakin nokta arama penceresi, ileri [dugum]
 win_back = 20;        % geri [dugum]
 fin = struct('n_laps', 3, 'v_stop', 0.05, 't_hold', 0.5);   % bitis olcutleri (Ts = Ts_ctrl ayri)
-stop_enable = 1;      % 0: bitis mantigi kapali (plant testleri)
+stop_enable = 1;      % 0: bitis mantigi kapali
 
 %% --- Kontrolculer (S3) ---
-ctrl_enable = 1;      % 1: MPC komutlari plant'a; 0: test girisleri (Fx_in, delta_in)
 % Yanal MPC: x = [e_y e_y' (e_psi - e_psi,ss) e_psi'], giris delta (lat_mpc)
 mpc_lat = struct('Np', 30, 'Q', diag([70 10 150 30]), 'R', 0, 'Rd', 1, ...
     'ulim', deg2rad([-30 30]), 'dumax', 1.5*Ts_ctrl, 'isoft', 0, 'ws', 1, ...
@@ -73,19 +72,14 @@ X0       = ref.x(ref.idx0);   % global konum X [m] (yolun baslangic noktasi)
 Y0       = ref.y(ref.idx0);   % global konum Y [m]
 psi0     = ref.theta0;        % yaw acisi [rad] (yol yonu)
 
-%% --- Test girisleri (From Workspace, [t u]; son degerde tutulur) ---
-Fx_in    = [0 250; T_end 250];   % toplam boyuna kuvvet [N]
-delta_in = [0 0;   T_end 0];     % on teker direksiyon acisi [rad]
-
 %% --- Workspace ---
 ms_names__ = {'m','Iz','L','lr','lf','Cf','Cr', ...
          'rho_air','CdA','C_rr','g','theta_road', ...
          'vx_floor','brake_split','mu','h','Ts_plant','T_end', ...
          'vx0_init','vy0_init','r0_init','X0','Y0','psi0', ...
-         'Fx_in','delta_in', ...
          'Ts_ctrl','map_name','waypoints','startPt','prm_ref','ref', ...
          'win_fwd','win_back','fin','stop_enable', ...
-         'ctrl_enable','mpc_lat','mpc_lon'};
+         'mpc_lat','mpc_lon'};
 % Dongu/liste degiskenleri cagiranin degiskenleriyle cakismasin diye
 % benzersiz adli; yalniz bunlar temizlenir.
 for ms_i__ = 1:numel(ms_names__)
